@@ -1,310 +1,559 @@
-const MUSICBRAINZ_URL = "https://musicbrainz.org/ws/2";
-const USER_AGENT = "NextTrack/1.0 ";
+const assert = require("assert");
 
-const MUSICBRAINZ_DELAY = 5000; // 5000 ms = 5 seconds
-const ERROR_DELAY_BEFORE_RETRY = 5000; // 5000 ms = 5 seconds
-
-let lastMusicBrainzRequest = 0;
-
-function sleep(ms) {
-    return new Promise((resolve) => {
-        setTimeout(resolve, ms);
-    });
-}
-
-function normalise(value) {
-    return String(value || "")
-        .trim()
-        .toLowerCase();
-}
-
-async function musicBrainzRequest(url, retries = 3) {
-    const elapsed = Date.now() - lastMusicBrainzRequest;
-
-    if (elapsed < MUSICBRAINZ_DELAY) {
-        await sleep(MUSICBRAINZ_DELAY - elapsed);
-    }
-
-    for (let attempt = 1; attempt <= retries; attempt++) {
-
-        try {
-            lastMusicBrainzRequest = Date.now();
-
-            const response = await fetch(url, {
-                headers: {
-                    "User-Agent": USER_AGENT,
-                    "Accept": "application/json"
-                }
-            });
-
-            if (response.status === 503) {
-                // 503 service unavailable,
-                console.log("Error when calling MusicBrainz API (http 503) service unavailable!");
-
-                // Pause for 5 seconds instead of just continue hammering the API
-                await sleep(ERROR_DELAY_BEFORE_RETRY);
-                continue;
-            }
-
-            if (!response.ok) {
-                throw new Error(`MusicBrainz API request failed: ${response.status}`);
-            }
-            return await response.json();
-        } 
-        catch (error) {
-            if (attempt === retries) {
-                throw error;
-            }
-
-            console.log(`Exception error when calling MusicBrainz API: ${error}`);
-            await sleep(ERROR_DELAY_BEFORE_RETRY);
-        }
-    }
-
-    throw new Error("MusicBrainz API request failed");
-}
-
-// Search track to extract metadata from
-async function searchTrack(title, artist) {
-    const query =`recording:"${title}" AND artist:"${artist}"`;
-    const url =`${MUSICBRAINZ_URL}/recording/` + `?query=${encodeURIComponent(query)}` + `&fmt=json` + `&limit=5`;
-
-    const data = await musicBrainzRequest(url);
-
-    // If no data found
-    if (!data.recordings || data.recordings.length === 0) {
-        return null;
-    }
-
-    const exactMatch =data.recordings.find((recording) => {
-        const recordingTitle = normalise(recording.title);
-        const recordingArtist =
-            (recording["artist-credit" ] || [])
-            .map((credit) => normalise(credit.name))
-            .join(" ");
-
-        return (
-            recordingTitle === normalise(title) && 
-            recordingArtist.includes(normalise(artist)
-        ));
-    });
-
-    return (exactMatch || data.recordings[0]);
-}
-
-// Get metadata from a track
-async function getRecordingMetadata(mbid) {
-    const url =
-        `${MUSICBRAINZ_URL}/recording/${mbid}` +
-        `?inc=artist-credits+releases+genres+tags` +
-        `&fmt=json`;
-
-    return await musicBrainzRequest(url);
-}
-
-// Extract features from tracks
-function extractTrackFeatures(metadata) {
-    const artist = metadata["artist-credit"]?.[0]?.name || "Unknown Artist";
-    const genres = (metadata.genres || []).map((genre) => normalise(genre.name));
-    const tags = (metadata.tags || []).map((tag) => normalise(tag.name));
-
-    return {
-        mbid: metadata.id,
-        title: metadata.title,
-        artist,
-        genres,
-        tags,
-        length: metadata.length || null,
-        firstReleaseDate: metadata["first-release-date"] || null
-    };
-}
-
-async function getUserTrack(title, artist) {
-    console.log(`Searching for: ${title} - ${artist}`);
-    const recording = await searchTrack(title, artist);
-
-    if (!recording) {
-        throw new Error(`Error searching for track: ${title}, ${artist}`);
-    }
-
-    // Extract metadata
-    const metadata = await getRecordingMetadata(recording.id);
-
-    // Return it after having features extracted from metadata
-    return extractTrackFeatures(metadata);
-}
-
-// Create temporary user preference profile
-function createPreferenceProfile(tracks) {
-    const genreCounts = {};
-    const tagCounts = {};
-
-    for (const track of tracks) {
-        for (const genre of track.genres) {
-            genreCounts[genre] = (genreCounts[genre] || 0) + 1;
-        }
-        for (const tag of track.tags) {
-            tagCounts[tag] = (tagCounts[tag] || 0) + 1;
-        }
-    }
-
-    return {
-        trackCount: tracks.length,
-        genres: genreCounts,
-        tags: tagCounts
-    };
-}
-
-// Get strongest features
-function getStrongFeatures(featureCounts, trackCount) {
-    return Object.entries(featureCounts)
-        .map(([feature, count]) => {
-                return {
-                    feature,
-                    count,
-                    frequency:count / trackCount
-                };
-            }
-        )
-        .sort((a, b) => b.frequency - a.frequency);
-}
-
-// Generate candidates
-async function generateCandidates(preferenceProfile) {
-    const candidateMap = new Map();
-    const strongFeatures = [
-        ...getStrongFeatures(
-            preferenceProfile.genres,
-            preferenceProfile.trackCount),
-        ...getStrongFeatures(
-            preferenceProfile.tags,
-            preferenceProfile.trackCount
-        )
-    ]
-    .sort((a, b) => b.frequency - a.frequency).slice(0, 2);
-
-    if (strongFeatures.length === 0) {
-        return [];
-    }
-
-    for (const item of strongFeatures) {
-        console.log(`Searching for candidates using feature: ${item.feature}`);
-        
-        const query = `tag:"${item.feature}"`;
-        const url =
-            `${MUSICBRAINZ_URL}/recording/` +
-            `?query=${encodeURIComponent(query)}` +
-            `&fmt=json` +
-            `&limit=5`;
-
-        const data = await musicBrainzRequest(url);
-        for (const recording of data.recordings || []) {
-            if (!candidateMap.has(recording.id)) {
-                candidateMap.set(
-                    recording.id,
-                    recording
-                );
-            }
-        }
-    }
-
-    return Array.from(
-        candidateMap.values()
-    );
-}
-
-// Filter submitted tracks
-function filterSubmittedTracks(candidates, inputTracks) {
-    const submittedIds = new Set(inputTracks.map( (track) => track.mbid));
-
-    // Filter out input tracks from candidates (if any)
-    return candidates.filter(
-        (candidate) => !submittedIds.has(candidate.id)
-    );
-}
-
-// Score candidate
-function calculateScore(candidate, preferenceProfile) {
-    let score = 0;
-    const trackCount = preferenceProfile.trackCount;
-
-    const candidateGenres = (candidate.genres || []) 
-        .map((genre) => normalise(genre.name));
-
-    const candidateTags = (candidate.tags || [])
-        .map((tag) => normalise(tag.name));
-
-    // Genre similarity
-    for (const genre of candidateGenres) {
-        const frequency = preferenceProfile.genres[genre] || 0;
-        if (frequency > 0) {
-            score += (frequency / trackCount) * 3;
-        }
-    }
-
-    // Tag for similarity
-    for (const tag of candidateTags) {
-        const frequency = preferenceProfile.tags[tag] || 0;
-        if (frequency > 0) {
-            score += (frequency / trackCount) * 1;
-        }
-    }
-
-    return score;
-}
-
-// Recommend track
-async function recommendTrack(inputTracks, preferenceProfile) {
-    const rawCandidates = await generateCandidates(preferenceProfile);
-    console.log(`Found ${rawCandidates.length} candidate recordings`);
-
-    // Filter out any inputTracks if found in rawCandidates
-    const candidates = filterSubmittedTracks(rawCandidates, inputTracks);
-    console.log(`${candidates.length} candidates remain after filtering`);
-
-    if (candidates.length === 0) {
-        console.log(`Candidates not available: 0`);
-        return null;
-    }
-
-    const scoredCandidates = [];
-    const candidatesToScore = candidates.slice(0, 5); // Take 5 only
-
-    for (const candidate of candidatesToScore) {
-        try {
-            console.log(`Analysing candidate: ${candidate.title}`);
-            const metadata = await getRecordingMetadata(candidate.id);
-            const features = extractTrackFeatures(metadata);
-            const score = calculateScore(metadata, preferenceProfile);
-
-            scoredCandidates.push({
-                ...features,
-                score
-            });
-
-        } 
-        catch (error) {
-            console.error(
-                `Error when processing candidate: ${candidate.title}: ${error.message}`
-            );
-        }
-    }
-
-    scoredCandidates.sort((a, b) => b.score - a.score);
-    return (scoredCandidates[0] || null);
-}
-
-module.exports = {
-    getUserTrack,
+const {
     createPreferenceProfile,
-    recommendTrack,
-
-    // For unit testing
-    searchTrack,
-    getRecordingMetadata,
     extractTrackFeatures,
     getStrongFeatures,
-    generateCandidates,
     filterSubmittedTracks,
     calculateScore
-};
+} = require("../algorithm");
+
+describe("NextTrack Recommendation Core Functions (algorithm.js)", function () {
+
+    // createPreferenceProfile()
+    describe("createPreferenceProfile()", function () {
+
+        it("should count genres and tags from all input tracks", function () {
+            const tracks = [
+                {
+                    genres: ["pop", "dance"],
+                    tags: ["party", "pop"]
+                },
+                {
+                    genres: ["pop"],
+                    tags: ["party"]
+                },
+                {
+                    genres: ["rock"],
+                    tags: ["live"]
+                }
+            ];
+
+            const profile = createPreferenceProfile(tracks);
+
+            assert.strictEqual(profile.trackCount, 3);
+            assert.strictEqual(profile.genres.pop, 2);
+            assert.strictEqual(profile.genres.dance, 1);
+            assert.strictEqual(profile.genres.rock, 1);
+            assert.strictEqual(profile.tags.party, 2);
+            assert.strictEqual(profile.tags.pop, 1);
+            assert.strictEqual(profile.tags.live, 1);
+        });
+
+        it("should keep genre and tag counts separately", function () {
+            const tracks = [
+                {
+                    genres: ["pop"],
+                    tags: ["pop"]
+                },
+                {
+                    genres: ["pop"],
+                    tags: ["dance"]
+                }
+            ];
+
+            const profile = createPreferenceProfile(tracks);
+
+            assert.strictEqual(profile.genres.pop, 2);
+            assert.strictEqual(profile.tags.pop, 1);
+            assert.strictEqual(profile.tags.dance, 1);
+        });
+
+        it("should correctly count repeated features", function () {
+            const tracks = [
+                {
+                    genres: ["electro house"],
+                    tags: ["electronic"]
+                },
+                {
+                    genres: ["electro house"],
+                    tags: ["electronic"]
+                },
+                {
+                    genres: ["electro house"],
+                    tags: ["party"]
+                }
+            ];
+
+            const profile = createPreferenceProfile(tracks);
+
+            assert.strictEqual(
+                profile.genres["electro house"],
+                3
+            );
+
+            assert.strictEqual(
+                profile.tags.electronic,
+                2
+            );
+
+            assert.strictEqual(
+                profile.tags.party,
+                1
+            );
+        });
+
+        it("should create an empty user preference profile when no tracks are provided", function () {
+            const profile = createPreferenceProfile([]);
+
+            assert.strictEqual(profile.trackCount, 0);
+            assert.deepStrictEqual(profile.genres, {});
+            assert.deepStrictEqual(profile.tags, {});
+        });
+
+    });
+
+    // extractTrackFeatures()
+    describe("extractTrackFeatures()", function () {
+
+        it("should extract track features from metadata", function () {
+            const metadata = {
+                id: "12345",
+                title: "Test song",
+                "artist-credit": [
+                    {
+                        name: "Test Artist"
+                    }
+                ],
+                genres: [
+                    {
+                        name: "Pop"
+                    },
+                    {
+                        name: "Dance"
+                    }
+                ],
+                tags: [
+                    {
+                        name: "Party"
+                    },
+                    {
+                        name: "Electronic"
+                    }
+                ],
+                length: 200000,
+                "first-release-date": "2020-01-01"
+            };
+
+            const result = extractTrackFeatures(metadata);
+
+            assert.strictEqual(result.mbid, "12345");
+            assert.strictEqual(result.title, "Test song");
+            assert.strictEqual(result.artist, "Test Artist");
+            assert.deepStrictEqual(
+                result.genres,
+                ["pop", "dance"]
+            );
+            assert.deepStrictEqual(
+                result.tags,
+                ["party", "electronic"]
+            );
+            assert.strictEqual(result.length, 200000);
+            assert.strictEqual(
+                result.firstReleaseDate,
+                "2020-01-01"
+            );
+        });
+
+        it("should use Unknown Artist when artist metadata is missing/ incomplete", function () {
+            const metadata = {
+                id: "123",
+                title: "Unknown Song"
+            };
+
+            const result = extractTrackFeatures(metadata);
+
+            assert.strictEqual(
+                result.artist,
+                "Unknown Artist"
+            );
+            assert.deepStrictEqual(result.genres, []);
+            assert.deepStrictEqual(result.tags, []);
+            assert.strictEqual(result.length, null);
+            assert.strictEqual(
+                result.firstReleaseDate,
+                null
+            );
+        });
+    });
+
+    // getStrongFeatures()
+    describe("getStrongFeatures()", function () {
+
+        it("should return features ordered by their frequency", function () {
+            const featureCounts = {
+                pop: 3,
+                dance: 2,
+                rock: 1
+            };
+
+            const result = getStrongFeatures(
+                featureCounts,
+                3
+            );
+
+            assert.strictEqual(
+                result[0].feature,
+                "pop"
+            );
+
+            assert.strictEqual(
+                result[1].feature,
+                "dance"
+            );
+
+            assert.strictEqual(
+                result[2].feature,
+                "rock"
+            );
+        });
+
+        it("should correctly calculate feature frequency", function () {
+            const featureCounts = {
+                pop: 3,
+                dance: 1
+            };
+
+            const result = getStrongFeatures(
+                featureCounts,
+                4
+            );
+
+            assert.strictEqual(
+                result[0].frequency,
+                0.75
+            );
+
+            assert.strictEqual(
+                result[1].frequency,
+                0.25
+            );
+        });
+
+        it("should return an empty array when no features exist", function () {
+            const result = getStrongFeatures({}, 3);
+
+            assert.deepStrictEqual(result, []);
+        });
+    });
+
+    // filterSubmittedTracks()
+    describe("filterSubmittedTracks()", function () {
+
+        it("should remove tracks already submitted by the user", function () {
+            const inputTracks = [
+                {
+                    mbid: "track-1"
+                },
+                {
+                    mbid: "track-2"
+                }
+            ];
+
+            const candidates = [
+                {
+                    id: "track-1",
+                    title: "Already Played"
+                },
+                {
+                    id: "track-3",
+                    title: "New Track"
+                },
+                {
+                    id: "track-4",
+                    title: "Another New Track"
+                }
+            ];
+
+            const result = filterSubmittedTracks(
+                candidates,
+                inputTracks
+            );
+
+            assert.strictEqual(result.length, 2);
+            assert.strictEqual(result[0].id, "track-3");
+            assert.strictEqual(result[1].id, "track-4");
+        });
+
+        it("should keep all candidates when none were submitted", function () {
+            const inputTracks = [
+                {
+                    mbid: "track-1"
+                }
+            ];
+
+            const candidates = [
+                {
+                    id: "track-2",
+                    title: "Track Two"
+                },
+                {
+                    id: "track-3",
+                    title: "Track Three"
+                }
+            ];
+
+            const result = filterSubmittedTracks(
+                candidates,
+                inputTracks
+            );
+
+            assert.strictEqual(result.length, 2);
+        });
+
+        it("should return an empty array when all candidates were submitted", function () {
+            const inputTracks = [
+                {
+                    mbid: "track-1"
+                },
+                {
+                    mbid: "track-2"
+                }
+            ];
+
+            const candidates = [
+                {
+                    id: "track-1",
+                    title: "Track One"
+                },
+                {
+                    id: "track-2",
+                    title: "Track Two"
+                }
+            ];
+
+            const result = filterSubmittedTracks(
+                candidates,
+                inputTracks
+            );
+
+            assert.deepStrictEqual(result, []);
+        });
+    });
+
+    // calculateScore()
+    describe("calculateScore()", function () {
+
+        it("should calculate a score for matching features", function () {
+            const candidate = {
+                genres: [
+                    {
+                        name: "pop"
+                    }
+                ],
+                tags: [
+                    {
+                        name: "party"
+                    }
+                ]
+            };
+
+            const preferenceProfile = {
+                trackCount: 4,
+                genres: {
+                    pop: 3
+                },
+                tags: {
+                    party: 2
+                }
+            };
+
+            const score = calculateScore(
+                candidate,
+                preferenceProfile
+            );
+
+            // Genre: 3 / 4 * 3 = 2.25
+            // Tag:   2 / 4 * 1 = 0.50
+            // Total: 2.75
+            assert.strictEqual(score, 2.75);
+        });
+
+        it("should give genre similarity a higher weight than tag similarity", function () {
+            const candidate = {
+                genres: [
+                    {
+                        name: "pop"
+                    }
+                ],
+                tags: [
+                    {
+                        name: "party"
+                    }
+                ]
+            };
+
+            const preferenceProfile = {
+                trackCount: 2,
+                genres: {
+                    pop: 2
+                },
+                tags: {
+                    party: 2
+                }
+            };
+
+            const score = calculateScore(
+                candidate,
+                preferenceProfile
+            );
+
+            // Genre: 2 / 2 * 3 = 3
+            // Tag:   2 / 2 * 1 = 1
+            // Total: 4
+            assert.strictEqual(score, 4);
+        });
+
+        it("should return zero when no features match", function () {
+            const candidate = {
+                genres: [
+                    {
+                        name: "rock"
+                    }
+                ],
+                tags: [
+                    {
+                        name: "metal"
+                    }
+                ]
+            };
+
+            const preferenceProfile = {
+                trackCount: 3,
+                genres: {
+                    pop: 2
+                },
+                tags: {
+                    party: 2
+                }
+            };
+
+            const score = calculateScore(
+                candidate,
+                preferenceProfile
+            );
+
+            assert.strictEqual(score, 0);
+        });
+
+        it("should calculate score using only matching genres", function () {
+            const candidate = {
+                genres: [
+                    {
+                        name: "pop"
+                    }
+                ],
+                tags: [
+                    {
+                        name: "rock"
+                    }
+                ]
+            };
+
+            const preferenceProfile = {
+                trackCount: 4,
+                genres: {
+                    pop: 2
+                },
+                tags: {
+                    party: 3
+                }
+            };
+
+            const score = calculateScore(
+                candidate,
+                preferenceProfile
+            );
+
+            // 2 / 4 * 3 = 1.5
+            assert.strictEqual(score, 1.5);
+        });
+
+        it("should calculate a score using only matching tags", function () {
+            const candidate = {
+                genres: [
+                    {
+                        name: "rock"
+                    }
+                ],
+                tags: [
+                    {
+                        name: "party"
+                    }
+                ]
+            };
+
+            const preferenceProfile = {
+                trackCount: 4,
+                genres: {
+                    pop: 2
+                },
+                tags: {
+                    party: 2
+                }
+            };
+
+            const score = calculateScore(
+                candidate,
+                preferenceProfile
+            );
+
+            // 2 / 4 * 1 = 0.5
+            assert.strictEqual(score, 0.5);
+        });
+
+        it("should add scores from multiple matching genres", function () {
+            const candidate = {
+                genres: [
+                    {
+                        name: "pop"
+                    },
+                    {
+                        name: "dance"
+                    }
+                ],
+                tags: []
+            };
+
+            const preferenceProfile = {
+                trackCount: 4,
+                genres: {
+                    pop: 2,
+                    dance: 1
+                },
+                tags: {}
+            };
+
+            const score = calculateScore(
+                candidate,
+                preferenceProfile
+            );
+
+            // Pop:   2 / 4 * 3 = 1.50
+            // Dance: 1 / 4 * 3 = 0.75
+            // Total: 2.25
+            assert.strictEqual(score, 2.25);
+        });
+
+        it("should handle missing genres and tags", function () {
+            const candidate = {};
+
+            const preferenceProfile = {
+                trackCount: 3,
+                genres: {
+                    pop: 2
+                },
+                tags: {
+                    party: 1
+                }
+            };
+
+            const score = calculateScore(
+                candidate,
+                preferenceProfile
+            );
+
+            assert.strictEqual(score, 0);
+        });
+    });
+});
