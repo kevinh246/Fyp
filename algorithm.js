@@ -255,7 +255,7 @@ function calculateScore(candidate, preferenceProfile) {
 
 // Recommend track
 async function recommendTrack(inputTracks, preferenceProfile) {
-    const rawCandidates =await generateCandidates(preferenceProfile);
+    const rawCandidates = await generateCandidates(preferenceProfile);
     console.log(`Found ${rawCandidates.length} candidate recordings`);
 
     // Filter out any inputTracks if found in rawCandidates
@@ -268,7 +268,7 @@ async function recommendTrack(inputTracks, preferenceProfile) {
     }
 
     const scoredCandidates = [];
-    const candidatesToScore = candidates.slice(0, 5);
+    const candidatesToScore = candidates.slice(0, 5); // Take 5 only
 
     for (const candidate of candidatesToScore) {
         try {
@@ -297,5 +297,14 @@ async function recommendTrack(inputTracks, preferenceProfile) {
 module.exports = {
     getUserTrack,
     createPreferenceProfile,
-    recommendTrack
+    recommendTrack,
+
+    // For unit testing
+    searchTrack,
+    getRecordingMetadata,
+    extractTrackFeatures,
+    getStrongFeatures,
+    generateCandidates,
+    filterSubmittedTracks,
+    calculateScore
 };
