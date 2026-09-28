@@ -37,7 +37,6 @@ app.post("/api/recommend", async (req, res) => {
             }
         }
 
-
         // Get metadata
         const inputTracks = [];
 
@@ -55,7 +54,7 @@ app.post("/api/recommend", async (req, res) => {
         console.log(JSON.stringify(preferenceProfile, null, 2));
 
         // Call the recommendation function
-        const recommendation = await recommendTrack( inputTracks, preferenceProfile);
+        const recommendation = await recommendTrack(inputTracks, preferenceProfile);
 
         if (!recommendation) {
             console.log("No suitable recommendation found");
